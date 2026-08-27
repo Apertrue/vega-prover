@@ -11,6 +11,7 @@ license-file = "LICENSE"
 keywords = ["zkSNARKs", "cryptography", "proofs"]
 
 [dependencies]
+web-time = "1"
 bellpepper-core = "0.4.0"
 bellpepper = "0.4.0"
 ff = { version = "0.13.0", features = ["derive"] }
