@@ -2,7 +2,8 @@
 # Keccak transcript known-answer vector). Every other fixture -- keys, proofs,
 # digests, and the meta.json metadata -- is git-ignored and regenerable on demand,
 # because the keys are large and the proofs are randomized. Regenerate with:
-#   Rust cubic oracle (cubic/proof.bin, vk.bin, vk_digest.bin, meta.json):
+#   Rust cubic oracles (cubic/ and shared_cubic/: proof.bin, vk.bin,
+#   vk_digest.bin, meta.json):
 #     cargo test --lib export_cubic_fixtures     -- --ignored --nocapture
 #   Rust transcript known-answer vector (cubic/transcript_vector.json):
 #     cargo test --lib export_transcript_vector  -- --ignored --nocapture
@@ -13,6 +14,7 @@
 #     python3 reference/tests/test_standalone.py
 fixtures/cubic/*.bin
 fixtures/cubic/meta.json
+fixtures/shared_cubic/
 
 # Python bytecode
 __pycache__/
