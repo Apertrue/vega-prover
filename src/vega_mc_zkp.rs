@@ -2132,6 +2132,35 @@ where
       });
     }
 
+    // The prover writes the shared commitment once, in `self.comm_W_shared`, and clears each
+    // instance's copy. The injection below overwrites whatever an instance carries, so a copy
+    // left in an instance would never be checked and a valid proof would verify under a second
+    // encoding. Refuse any such copy, and require the proof's own copy exactly when the shared
+    // segment is non-empty (`validate` checks the core shape against the same copy).
+    if let Some(i) = self
+      .step_instances
+      .iter()
+      .position(|u| u.comm_W_shared.is_some())
+    {
+      return Err(VegaError::InvalidSharedCommitment {
+        reason: format!("step instance {i} carries its own copy of the shared commitment"),
+      });
+    }
+    if self.core_instance.comm_W_shared.is_some() {
+      return Err(VegaError::InvalidSharedCommitment {
+        reason: "the core instance carries its own copy of the shared commitment".to_string(),
+      });
+    }
+    if (vk.S_step.num_shared > 0) != self.comm_W_shared.is_some() {
+      return Err(VegaError::InvalidSharedCommitment {
+        reason: if vk.S_step.num_shared > 0 {
+          "the proof's shared commitment is missing".to_string()
+        } else {
+          "the proof carries a shared commitment for an empty shared segment".to_string()
+        },
+      });
+    }
+
     // Reconstruct step instances and core instance with the shared commitment
     let step_instances: Vec<SplitR1CSInstance<E>> = self
       .step_instances
@@ -2642,6 +2671,179 @@ mod tests {
     for num_steps in [0, 1] {
       assert!(VegaMcZkSNARK::<E>::setup(&circuit, &circuit, num_steps).is_err());
     }
+  }
+
+  // The cubic circuit with x in the shared segment, so a proof carries one shared commitment
+  // that every step instance and the core have in common.
+  #[derive(Clone, Debug, Default)]
+  struct SharedCubicCircuit {}
+
+  impl<E: Engine> VegaCircuit<E> for SharedCubicCircuit {
+    fn public_values(&self) -> Result<Vec<E::Scalar>, SynthesisError> {
+      Ok(vec![E::Scalar::from(15u64)])
+    }
+
+    fn shared<CS: ConstraintSystem<E::Scalar>>(
+      &self,
+      cs: &mut CS,
+    ) -> Result<Vec<AllocatedNum<E::Scalar>>, SynthesisError> {
+      let x = AllocatedNum::alloc(cs.namespace(|| "x"), || Ok(E::Scalar::from(2u64)))?;
+      Ok(vec![x])
+    }
+
+    fn precommitted<CS: ConstraintSystem<E::Scalar>>(
+      &self,
+      _: &mut CS,
+      _: &[AllocatedNum<E::Scalar>],
+    ) -> Result<Vec<AllocatedNum<E::Scalar>>, SynthesisError> {
+      Ok(vec![])
+    }
+
+    fn num_challenges(&self) -> usize {
+      0
+    }
+
+    fn synthesize<CS: ConstraintSystem<E::Scalar>>(
+      &self,
+      cs: &mut CS,
+      shared: &[AllocatedNum<E::Scalar>],
+      _precommitted: &[AllocatedNum<E::Scalar>],
+      _challenges: Option<&[E::Scalar]>,
+    ) -> Result<(), SynthesisError> {
+      let x = &shared[0];
+      let x_sq = x.square(cs.namespace(|| "x_sq"))?;
+      let x_cu = x_sq.mul(cs.namespace(|| "x_cu"), x)?;
+      let y = AllocatedNum::alloc(cs.namespace(|| "y"), || {
+        Ok(x_cu.get_value().unwrap() + x.get_value().unwrap() + E::Scalar::from(5u64))
+      })?;
+
+      cs.enforce(
+        || "y = x^3 + x + 5",
+        |lc| {
+          lc + x_cu.get_variable()
+            + x.get_variable()
+            + CS::one()
+            + CS::one()
+            + CS::one()
+            + CS::one()
+            + CS::one()
+        },
+        |lc| lc + CS::one(),
+        |lc| lc + y.get_variable(),
+      );
+
+      y.inputize(cs.namespace(|| "output"))?;
+
+      Ok(())
+    }
+  }
+
+  // A copy of a proof through its serialised form, as a verifier receives it.
+  fn reencode<E: Engine>(snark: &VegaMcZkSNARK<E>) -> VegaMcZkSNARK<E>
+  where
+    E::PCS: FoldingEngineTrait<E>,
+  {
+    bincode::deserialize(&bincode::serialize(snark).unwrap()).unwrap()
+  }
+
+  fn assert_shared_commitment_refused<E: Engine>(
+    what: &str,
+    res: Result<(Vec<Vec<E::Scalar>>, Vec<E::Scalar>), VegaError>,
+  ) {
+    assert!(
+      matches!(res, Err(VegaError::InvalidSharedCommitment { .. })),
+      "{what}: expected InvalidSharedCommitment, got {res:?}"
+    );
+  }
+
+  #[test]
+  fn test_mc_zk_refuses_a_shared_commitment_not_written_once() {
+    type E = T256HyraxEngine;
+    let num_circuits = 3;
+    let circuits = vec![SharedCubicCircuit::default(); num_circuits];
+    let (pk, vk) = VegaMcZkSNARK::<E>::setup(&circuits[0], &circuits[0], num_circuits).unwrap();
+    let ps = VegaMcZkSNARK::<E>::prep_prove(&pk, &circuits, &circuits[0], true).unwrap();
+    let (snark, _) = VegaMcZkSNARK::prove(&pk, &circuits, &circuits[0], ps, true).unwrap();
+
+    // The prover writes the shared commitment once, and that proof verifies.
+    assert!(snark.comm_W_shared.is_some());
+    assert!(
+      snark
+        .step_instances
+        .iter()
+        .all(|u| u.comm_W_shared.is_none())
+    );
+    assert!(snark.core_instance.comm_W_shared.is_none());
+    assert!(reencode(&snark).verify(&vk, num_circuits).is_ok());
+
+    // Its own shared commitment copied into any one step instance.
+    for i in 0..num_circuits {
+      let mut s = reencode(&snark);
+      s.step_instances[i].comm_W_shared = snark.comm_W_shared.clone();
+      assert_shared_commitment_refused::<E>(&format!("step {i}"), s.verify(&vk, num_circuits));
+    }
+
+    // Copied into the core instance.
+    let mut s = reencode(&snark);
+    s.core_instance.comm_W_shared = snark.comm_W_shared.clone();
+    assert_shared_commitment_refused::<E>("core", s.verify(&vk, num_circuits));
+
+    // Copied into every instance.
+    let mut s = reencode(&snark);
+    for u in s.step_instances.iter_mut() {
+      u.comm_W_shared = snark.comm_W_shared.clone();
+    }
+    s.core_instance.comm_W_shared = snark.comm_W_shared.clone();
+    assert_shared_commitment_refused::<E>("every instance", s.verify(&vk, num_circuits));
+
+    // Another commitment in a step instance.
+    let mut s = reencode(&snark);
+    s.step_instances[1].comm_W_shared = Some(snark.step_instances[0].comm_W_rest.clone());
+    assert_shared_commitment_refused::<E>("another commitment", s.verify(&vk, num_circuits));
+
+    // The proof's own copy removed.
+    let mut s = reencode(&snark);
+    s.comm_W_shared = None;
+    assert_shared_commitment_refused::<E>("copy removed", s.verify(&vk, num_circuits));
+
+    // The proof's copy moved into every instance instead.
+    let mut s = reencode(&snark);
+    for u in s.step_instances.iter_mut() {
+      u.comm_W_shared = snark.comm_W_shared.clone();
+    }
+    s.core_instance.comm_W_shared = snark.comm_W_shared.clone();
+    s.comm_W_shared = None;
+    assert_shared_commitment_refused::<E>("moved into instances", s.verify(&vk, num_circuits));
+  }
+
+  #[test]
+  fn test_mc_zk_refuses_a_shared_commitment_for_an_empty_segment() {
+    type E = T256HyraxEngine;
+    let num_circuits = 2;
+    let (pk, vk, circuits) = generate_cubic_r1cs::<E>(num_circuits);
+    let ps = VegaMcZkSNARK::<E>::prep_prove(&pk, &circuits, &circuits[0], true).unwrap();
+    let (snark, _) = VegaMcZkSNARK::prove(&pk, &circuits, &circuits[0], ps, true).unwrap();
+
+    // No shared segment: the proof carries no shared commitment anywhere, and verifies.
+    assert!(snark.comm_W_shared.is_none());
+    assert!(reencode(&snark).verify(&vk, num_circuits).is_ok());
+
+    // A commitment written into a step instance. Before this refusal, the injection
+    // overwrote it with the proof's empty copy and the proof verified.
+    let comm = snark.step_instances[0].comm_W_rest.clone();
+    let mut s = reencode(&snark);
+    s.step_instances[0].comm_W_shared = Some(comm.clone());
+    assert_shared_commitment_refused::<E>("step", s.verify(&vk, num_circuits));
+
+    // Written into the core instance.
+    let mut s = reencode(&snark);
+    s.core_instance.comm_W_shared = Some(comm.clone());
+    assert_shared_commitment_refused::<E>("core", s.verify(&vk, num_circuits));
+
+    // Written as the proof's own copy.
+    let mut s = reencode(&snark);
+    s.comm_W_shared = Some(comm);
+    assert_shared_commitment_refused::<E>("proof's copy", s.verify(&vk, num_circuits));
   }
 
   // Emits a deterministic Keccak-transcript conformance vector for the external

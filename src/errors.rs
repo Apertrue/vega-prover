@@ -39,6 +39,14 @@ pub enum VegaError {
     /// The reason for the proof verification error
     reason: String,
   },
+  /// returned if a multi-circuit proof does not carry the shared commitment exactly once:
+  /// a step or core instance carries its own copy, or the proof's single copy is missing
+  /// for a non-empty shared segment or present for an empty one
+  #[error("InvalidSharedCommitment: {reason}")]
+  InvalidSharedCommitment {
+    /// The reason the shared commitment was refused
+    reason: String,
+  },
   /// returned if the provided commitment key is not of sufficient length
   #[error("InvalidCommitmentKeyLength")]
   InvalidCommitmentKeyLength,
