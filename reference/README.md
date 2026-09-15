@@ -88,6 +88,7 @@ randomized. Regenerate them with:
 | Fixture | Regenerate with |
 | --- | --- |
 | `cubic/meta.json`, `cubic/proof.bin`, `cubic/vk.bin`, `cubic/vk_digest.bin` | `cargo test --lib export_cubic_fixtures -- --ignored` |
+| `shared_cubic/meta.json`, `shared_cubic/proof.bin`, `shared_cubic/vk.bin`, `shared_cubic/vk_digest.bin` (x in the shared segment) | `cargo test --lib export_cubic_fixtures -- --ignored` |
 | `cubic/transcript_vector.json` (Keccak transcript known-answer vector) | `cargo test --lib export_transcript_vector -- --ignored` |
 | `cubic/python_proof.bin` (reference proof vs the Rust `vk.bin`) | `python3 reference/tests/test_prove_finish.py` |
 | `cubic/python_vk.bin`, `cubic/python_standalone_proof.bin` (fully stand-alone) | `python3 reference/tests/test_standalone.py` |

@@ -2673,8 +2673,8 @@ mod tests {
     }
   }
 
-  // The cubic circuit with x in the shared segment, so a proof carries one shared commitment
-  // that every step instance and the core have in common.
+  /// The cubic circuit with x in the shared segment, so a proof carries one shared commitment
+  /// that every step instance and the core have in common.
   #[derive(Clone, Debug, Default)]
   struct SharedCubicCircuit {}
 
@@ -2738,7 +2738,7 @@ mod tests {
     }
   }
 
-  // A copy of a proof through its serialised form, as a verifier receives it.
+  /// A copy of a proof through its serialised form, as a verifier receives it.
   fn reencode<E: Engine>(snark: &VegaMcZkSNARK<E>) -> VegaMcZkSNARK<E>
   where
     E::PCS: FoldingEngineTrait<E>,
@@ -2746,6 +2746,7 @@ mod tests {
     bincode::deserialize(&bincode::serialize(snark).unwrap()).unwrap()
   }
 
+  /// Asserts that verification refused the proof with `InvalidSharedCommitment`.
   fn assert_shared_commitment_refused<E: Engine>(
     what: &str,
     res: Result<(Vec<Vec<E::Scalar>>, Vec<E::Scalar>), VegaError>,
@@ -2756,6 +2757,8 @@ mod tests {
     );
   }
 
+  /// With a shared segment: the honest proof verifies, and a copy of the shared commitment in
+  /// any instance, another commitment in a step, or the proof's copy removed or moved is refused.
   #[test]
   fn test_mc_zk_refuses_a_shared_commitment_not_written_once() {
     type E = T256HyraxEngine;
@@ -2816,6 +2819,8 @@ mod tests {
     assert_shared_commitment_refused::<E>("moved into instances", s.verify(&vk, num_circuits));
   }
 
+  /// Without a shared segment: the honest proof verifies, and a commitment in a step, in the
+  /// core, or as the proof's copy is refused.
   #[test]
   fn test_mc_zk_refuses_a_shared_commitment_for_an_empty_segment() {
     type E = T256HyraxEngine;
@@ -2902,24 +2907,51 @@ mod tests {
     );
   }
 
-  // Exports a tiny cubic (x^3+x+5=y) MC fixture used as a small oracle for the
-  // stand-alone Python reference implementation. Run explicitly with:
+  // Exports tiny cubic (x^3+x+5=y) MC fixtures used as a small oracle for the
+  // stand-alone Python reference implementation: `cubic`, with no shared segment,
+  // and `shared_cubic`, with x in the shared segment. Run explicitly with:
   //   cargo test --lib export_cubic_fixtures -- --ignored --nocapture
   #[test]
   #[ignore]
   fn export_cubic_fixtures() {
+    type E = T256HyraxEngine;
+    let num_circuits = 2usize;
+
+    let (pk, vk, circuits) = generate_cubic_r1cs::<E>(num_circuits);
+    write_mc_fixtures("cubic", "cubic x^3+x+5=y", &pk, &vk, &circuits);
+
+    let circuits = vec![SharedCubicCircuit::default(); num_circuits];
+    let (pk, vk) = VegaMcZkSNARK::<E>::setup(&circuits[0], &circuits[0], num_circuits).unwrap();
+    write_mc_fixtures(
+      "shared_cubic",
+      "cubic x^3+x+5=y, x shared",
+      &pk,
+      &vk,
+      &circuits,
+    );
+  }
+
+  /// Proves `circuits` (the first also as the core), checks the proof verifies, and writes
+  /// the proof, verifier key, key digest and metadata to `reference/fixtures/<name>`.
+  fn write_mc_fixtures<C: VegaCircuit<T256HyraxEngine>>(
+    name: &str,
+    circuit: &str,
+    pk: &VegaMcProverKey<T256HyraxEngine>,
+    vk: &VegaMcVerifierKey<T256HyraxEngine>,
+    circuits: &[C],
+  ) {
     use std::fs;
     type E = T256HyraxEngine;
 
-    let num_circuits = 2usize;
-    let (pk, vk, circuits) = generate_cubic_r1cs::<E>(num_circuits);
+    let num_circuits = circuits.len();
+    let ps = VegaMcZkSNARK::<E>::prep_prove(pk, circuits, &circuits[0], true).unwrap();
+    let (snark, _ps) = VegaMcZkSNARK::prove(pk, circuits, &circuits[0], ps, true).unwrap();
 
-    let ps = VegaMcZkSNARK::<E>::prep_prove(&pk, &circuits, &circuits[0], true).unwrap();
-    let (snark, _ps) = VegaMcZkSNARK::prove(&pk, &circuits, &circuits[0], ps, true).unwrap();
+    let (pv_step, pv_core) = snark.verify(vk, num_circuits).unwrap();
 
-    let (pv_step, pv_core) = snark.verify(&vk, num_circuits).unwrap();
-
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("reference/fixtures/cubic");
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+      .join("reference/fixtures")
+      .join(name);
     fs::create_dir_all(&dir).unwrap();
 
     let proof_bytes = bincode::serialize(&snark).unwrap();
@@ -2946,7 +2978,8 @@ mod tests {
       .collect();
 
     let meta = format!(
-      "{{\n  \"engine\": \"T256HyraxEngine\",\n  \"circuit\": \"cubic x^3+x+5=y\",\n  \"num_steps\": {},\n  \"proof_len\": {},\n  \"vk_len\": {},\n  \"public_values_step\": {:?},\n  \"public_values_core\": {:?}\n}}\n",
+      "{{\n  \"engine\": \"T256HyraxEngine\",\n  \"circuit\": \"{}\",\n  \"num_steps\": {},\n  \"proof_len\": {},\n  \"vk_len\": {},\n  \"public_values_step\": {:?},\n  \"public_values_core\": {:?}\n}}\n",
+      circuit,
       num_circuits,
       proof_bytes.len(),
       vk_bytes.len(),
@@ -2956,7 +2989,8 @@ mod tests {
     fs::write(dir.join("meta.json"), meta).unwrap();
 
     eprintln!(
-      "exported cubic fixtures to {}: proof={} B, vk={} B, digest=32 B",
+      "exported {} fixtures to {}: proof={} B, vk={} B, digest=32 B",
+      name,
       dir.display(),
       proof_bytes.len(),
       vk_bytes.len(),

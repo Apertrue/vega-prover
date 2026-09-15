@@ -4,7 +4,9 @@ This replays the exact Fiat--Shamir schedule and algebraic checks of
 ``src/vega_mc_zkp.rs`` and returns ``(public_values_step, public_values_core)`` on
 acceptance, raising on any mismatch. The flow:
 
-1. Restore the hoisted shared commitment into every step + core instance.
+1. Refuse a shared commitment not carried exactly once (an instance carrying its
+   own copy, or the proof's copy missing or extra for the shared segment), then
+   restore the hoisted shared commitment into every step + core instance.
 2. Validate each step instance and the core instance on *fresh* per-instance
    transcripts (re-deriving challenges from the transcript).
 3. Convert instances to regular form (padding steps to a power of two).
@@ -49,8 +51,21 @@ def verify(proof, vk, num_instances):
 
   digest = vk.digest()
 
-  # (1) restore the hoisted shared commitment into every instance
-  step_instances = [replace(u, comm_W_shared=proof.comm_W_shared) for u in proof.step_instances]
+  # (1) the proof carries the shared commitment once. The restore below overwrites each
+  # instance's copy, so a copy carried by an instance is refused before it, as is a proof
+  # whose own copy is missing for a non-empty shared segment or present for an empty one.
+  for i, u in enumerate(proof.step_instances):
+    if u.comm_W_shared is not None:
+      raise ValueError(f"step instance {i} carries its own copy of the shared commitment")
+  if proof.core_instance.comm_W_shared is not None:
+    raise ValueError("the core instance carries its own copy of the shared commitment")
+  if (vk.S_step.num_shared > 0) != (proof.comm_W_shared is not None):
+    if vk.S_step.num_shared > 0:
+      raise ValueError("the proof's shared commitment is missing")
+    raise ValueError("the proof carries a shared commitment for an empty shared segment")
+
+  # restore the hoisted shared commitment into every instance
+  step_instances =[replace(u, comm_W_shared=proof.comm_W_shared) for u in proof.step_instances]
   core_instance = replace(proof.core_instance, comm_W_shared=proof.comm_W_shared)
 
   # (2) validate the step instances, each on a fresh transcript
