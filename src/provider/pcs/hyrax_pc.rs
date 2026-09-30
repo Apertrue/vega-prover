@@ -70,6 +70,158 @@ where
   /// Enables fast per-row commits via table lookup instead of runtime MSM.
   #[serde(skip)]
   ck_tables: std::sync::OnceLock<Vec<FixedBaseMul<E>>>,
+  /// Precomputed fixed-base table over ALL ck bases, for committing rows of
+  /// full-size scalars (built lazily by the first such commit, not serialized).
+  #[serde(skip)]
+  fb_table: std::sync::OnceLock<FbTable<E>>,
+}
+
+/// Window width, in bits, of the fixed-base table.
+const FB_WINDOW_BITS: usize = 12;
+
+/// Rows shorter than this commit through the generic MSM: the table's bucket
+/// reduction costs about 2^FB_WINDOW_BITS additions whatever the row length,
+/// which only pays for itself once a row has this many scalars.
+const FB_MIN_LEN: usize = 128;
+
+/// A fixed-base table for multi-scalar multiplication over a commitment key:
+/// `t[w][i] = 2^(c*w) * ck[i]` in affine form, for `k = 256/c + 2` windows.
+///
+/// With every window's shift folded into the table, all windows of all
+/// scalars share one set of buckets, so an MSM of n full-size scalars costs
+/// about n * 256/c mixed additions plus one bucket reduction, with no
+/// doublings, rather than a Pippenger pass per window.
+///
+/// Variable time, like the generic MSM it replaces (`vartime_multiscalar_mul`):
+/// the scalars it is given are the prover's witness rows, which that path
+/// already processes in variable time.
+#[derive(Clone)]
+pub struct FbTable<E: Engine>
+where
+  E::GE: DlogGroup,
+{
+  c: usize,
+  t: Vec<Vec<AffineGroupElement<E>>>,
+}
+
+impl<E: Engine> core::fmt::Debug for FbTable<E>
+where
+  E::GE: DlogGroup,
+{
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    f.debug_struct("FbTable")
+      .field("c", &self.c)
+      .field("windows", &self.t.len())
+      .field("bases", &self.t.first().map_or(0, |w| w.len()))
+      .finish()
+  }
+}
+
+impl<E: Engine> FbTable<E>
+where
+  E::GE: DlogGroupExt,
+{
+  /// Builds the table for `bases` with `c`-bit windows. Serial on purpose: it
+  /// runs inside a `OnceLock` initialiser that rayon workers may be waiting
+  /// on, and a rayon job started from there can deadlock the pool.
+  pub fn new(bases: &[AffineGroupElement<E>], c: usize) -> Self {
+    assert!((1..=16).contains(&c), "fixed-base window of 1 to 16 bits");
+    use halo2curves::group::{Curve, Group, prime::PrimeCurveAffine};
+    let k = 256 / c + 2;
+    let n = bases.len();
+    let mut proj = Vec::with_capacity(k * n);
+    proj.extend(bases.iter().map(|b| b.to_curve()));
+    for w in 1..k {
+      for i in 0..n {
+        let mut p = proj[(w - 1) * n + i];
+        for _ in 0..c {
+          p = p.double();
+        }
+        proj.push(p);
+      }
+    }
+    // One field inversion for the whole table.
+    let mut affine = vec![AffineGroupElement::<E>::identity(); proj.len()];
+    Curve::batch_normalize(&proj[..], &mut affine);
+    let t = affine.chunks(n.max(1)).map(|w| w.to_vec()).collect();
+    Self { c, t }
+  }
+
+  /// `sum_i scalars[i] * ck[i]`, for `scalars` no longer than the key: the
+  /// same group element as `vartime_multiscalar_mul(scalars, &ck[..len])`.
+  pub fn msm(&self, scalars: &[E::Scalar]) -> E::GE {
+    let c = self.c;
+    let k = self.t.len();
+    assert!(
+      k > 0 && scalars.len() <= self.t[0].len(),
+      "FbTable::msm: more scalars than bases"
+    );
+    let half = 1i64 << (c - 1);
+    let full = 1i64 << c;
+    let mask = (1u64 << c) - 1;
+
+    // Scalars equal to one add their base directly; zeros add nothing.
+    let mut ones = E::GE::zero();
+    // buckets[d - 1] accumulates every table entry whose digit is +-d.
+    let mut buckets = vec![E::GE::zero(); half as usize];
+    let mut limbs = [0u64; 5];
+    for (i, s) in scalars.iter().enumerate() {
+      if *s == E::Scalar::ZERO {
+        continue;
+      }
+      if *s == E::Scalar::ONE {
+        ones = ones.add_affine_vartime(&self.t[0][i]);
+        continue;
+      }
+      let repr = s.to_repr();
+      let bytes = repr.as_ref();
+      debug_assert!(bytes.len() <= 32);
+      limbs[..4].fill(0);
+      for (j, b) in bytes.iter().enumerate() {
+        limbs[j / 8] |= (*b as u64) << ((j % 8) * 8);
+      }
+
+      // Signed digits in (-2^(c-1), 2^(c-1)], low window first, the borrow
+      // of a negative digit carried into the next window.
+      let mut carry = 0i64;
+      for (w, table) in self.t.iter().enumerate() {
+        let bit = w * c;
+        let raw = if bit >= 256 {
+          0
+        } else {
+          let (limb, off) = (bit / 64, bit % 64);
+          let mut v = limbs[limb] >> off;
+          if off + c > 64 {
+            v |= limbs[limb + 1] << (64 - off);
+          }
+          (v & mask) as i64
+        };
+        let mut digit = raw + carry;
+        carry = 0;
+        if digit > half {
+          digit -= full;
+          carry = 1;
+        }
+        if digit > 0 {
+          let b = &mut buckets[digit as usize - 1];
+          *b = b.add_affine_vartime(&table[i]);
+        } else if digit < 0 {
+          let b = &mut buckets[(-digit) as usize - 1];
+          *b = b.add_affine_vartime(&-table[i]);
+        }
+      }
+      debug_assert_eq!(carry, 0, "the table has a window for the last carry");
+    }
+
+    // sum_d d * buckets[d - 1], by running sums from the top bucket down.
+    let mut running = E::GE::zero();
+    let mut acc = E::GE::zero();
+    for b in buckets.iter().rev() {
+      running += b;
+      acc += &running;
+    }
+    acc + ones
+  }
 }
 
 impl<E: Engine> HyraxCommitmentKey<E>
@@ -171,6 +323,7 @@ where
       h,
       h_table: std::sync::OnceLock::new(),
       ck_tables: std::sync::OnceLock::new(),
+      fb_table: std::sync::OnceLock::new(),
     };
 
     (ck, vk)
@@ -290,8 +443,15 @@ where
               &ck.ck[..scalars_small.len()],
               false,
             )?
+          } else if scalars.len() >= FB_MIN_LEN {
+            // Full-size scalars: fixed-base MSM over the key's precomputed
+            // table. Built on first use by whichever row gets here first,
+            // serially, while the other rows wait for it.
+            ck.fb_table
+              .get_or_init(|| FbTable::new(&ck.ck, FB_WINDOW_BITS))
+              .msm(scalars)
           } else {
-            // Full-size scalars: direct MSM
+            // Full-size scalars in a short row: direct MSM
             E::GE::vartime_multiscalar_mul(scalars, &ck.ck[..scalars.len()], false)?
           }
         };
@@ -916,6 +1076,115 @@ mod tests {
 
   fn sample_point(num_vars: usize) -> Vec<Scalar> {
     (0..num_vars).map(|i| Scalar::from(i as u64 + 7)).collect()
+  }
+
+  mod fixed_base {
+    use super::super::*;
+    use crate::provider::{Bn254Engine, PallasHyraxEngine};
+    use rand::{Rng, SeedableRng, rngs::StdRng};
+
+    /// Checks FbTable::msm against the generic MSM on one scalar vector.
+    fn check<E: Engine>(table: &FbTable<E>, bases: &[AffineGroupElement<E>], s: &[E::Scalar])
+    where
+      E::GE: DlogGroupExt,
+    {
+      let want = E::GE::vartime_multiscalar_mul(s, &bases[..s.len()], false).unwrap();
+      assert_eq!(table.msm(s), want, "length {}", s.len());
+    }
+
+    /// A scalar whose every c-bit window holds `digit` (as far as 254 bits go).
+    fn repeated<E: Engine>(digit: u64, c: usize) -> E::Scalar {
+      let mut acc = E::Scalar::ZERO;
+      let shift = E::Scalar::from(1u64 << c);
+      for _ in 0..(253 / c) {
+        acc = acc * shift + E::Scalar::from(digit);
+      }
+      acc
+    }
+
+    fn vectors<E: Engine>(n: usize, c: usize, rng: &mut StdRng) -> Vec<Vec<E::Scalar>> {
+      let random = |rng: &mut StdRng, len: usize| -> Vec<E::Scalar> {
+        (0..len).map(|_| E::Scalar::random(&mut *rng)).collect()
+      };
+      let max = -E::Scalar::ONE;
+      let half = 1u64 << (c - 1);
+      let mut mixed = random(rng, n);
+      for (i, s) in mixed.iter_mut().enumerate() {
+        match i % 7 {
+          0 => *s = E::Scalar::ZERO,
+          1 => *s = E::Scalar::ONE,
+          2 => *s = max,
+          3 => *s = E::Scalar::from(rng.gen_range(2..1u64 << 20)),
+          4 => *s = -E::Scalar::from(rng.gen_range(1..1u64 << 20)),
+          _ => {}
+        }
+      }
+      vec![
+        random(rng, n),
+        vec![E::Scalar::ZERO; n],
+        vec![E::Scalar::ONE; n],
+        vec![max; n],
+        vec![repeated::<E>(half, c); n],
+        vec![repeated::<E>(half + 1, c); n],
+        vec![repeated::<E>((1 << c) - 1, c); n],
+        mixed,
+        random(rng, n / 2 + 3),
+        random(rng, 1),
+        vec![],
+      ]
+    }
+
+    fn matches_generic_msm<E: Engine>(n: usize, c: usize)
+    where
+      E::GE: DlogGroupExt,
+    {
+      let mut rng = StdRng::seed_from_u64(12);
+      let bases = E::GE::from_label(b"fixed base test", n);
+      let table = FbTable::<E>::new(&bases, c);
+      assert_eq!(table.t.len(), 256 / c + 2);
+      for s in vectors::<E>(n, c, &mut rng) {
+        check(&table, &bases, &s);
+      }
+    }
+
+    #[test]
+    fn fixed_base_msm_matches_the_generic_msm_on_bn254() {
+      matches_generic_msm::<Bn254Engine>(300, FB_WINDOW_BITS);
+      // Other widths exercise other digit and carry boundaries.
+      for c in [1, 5, 8, 11, 13, 16] {
+        matches_generic_msm::<Bn254Engine>(40, c);
+      }
+    }
+
+    #[test]
+    fn fixed_base_msm_matches_the_generic_msm_on_pallas() {
+      matches_generic_msm::<PallasHyraxEngine>(200, FB_WINDOW_BITS);
+    }
+
+    /// A commit through the table gives the commitment the generic MSM gives,
+    /// including a short last row and rows too short for the table.
+    #[test]
+    fn a_commit_through_the_table_matches_the_generic_msm() {
+      type E = Bn254Engine;
+      let width = 256;
+      let mut rng = StdRng::seed_from_u64(7);
+      for n in [3 * width, 2 * width + FB_MIN_LEN, 2 * width + 40, width + 1] {
+        let (ck, _) = <E as Engine>::PCS::setup(b"fb commit", n, width);
+        let v: Vec<_> = (0..n)
+          .map(|_| <E as Engine>::Scalar::random(&mut rng))
+          .collect();
+        let blind = <E as Engine>::PCS::blind(&ck, n);
+        let comm = <E as Engine>::PCS::commit(&ck, &v, &blind, false).unwrap();
+        assert!(ck.fb_table.get().is_some(), "the table was used");
+        for (row, got) in comm.comm.iter().enumerate() {
+          let s = &v[row * width..((row + 1) * width).min(n)];
+          let want = <E as Engine>::GE::vartime_multiscalar_mul(s, &ck.ck[..s.len()], false)
+            .unwrap()
+            + ck.h * blind.blind[row];
+          assert_eq!(*got, want, "n {n} row {row}");
+        }
+      }
+    }
   }
 
   // At the direct-opening boundary an empty or oversized commitment is rejected, and a
